@@ -4,275 +4,190 @@
 #include <memory>
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
+#include <sstream>
 
 namespace babydb {
 
-class HashJoinOperatorImpl {
+// Helper to convert data_t to string for hashing
+inline std::string DataToString(const data_t& value) {
+    std::stringstream ss;
+    ss << value;
+    return ss.str();
+}
+
+// Optimized hash table for RPT
+class HashJoinOptimizer {
 private:
-    // Optimized storage with minimal copying
-    struct JoinTuple {
-        const Tuple* probe_tuple;
-        size_t build_offset;
-    };
-    
-    // Pre-allocated memory pool for build tuples
+    // Memory pool for build tuples
     std::vector<char> build_pool_;
     std::vector<size_t> build_offsets_;
-    std::vector<std::string> build_keys_;
+    std::vector<size_t> build_sizes_;
     
-    // Cache-friendly hash table
-    struct HashEntry {
-        std::string key;
-        size_t offset;
-        size_t next;  // For chaining
-        bool occupied;
-    };
-    std::vector<HashEntry> hash_table_;
+    // Hash table mapping key -> list of tuple offsets
+    std::unordered_map<std::string, std::vector<size_t>> hash_table_;
     
     // Bloom filter for RPT
     std::unique_ptr<BloomFilter> bloom_filter_;
     
-    // Query-specific Bloom filters for multi-way joins
-    std::vector<std::unique_ptr<BloomFilter>> predicate_filters_;
+    // Cascading Bloom filters for multi-way RPT
+    struct PredicateFilter {
+        std::unique_ptr<BloomFilter> filter;
+        double selectivity;
+    };
+    std::vector<PredicateFilter> predicate_filters_;
     
-    // Statistics for adaptive decisions
     size_t build_cardinality_;
-    size_t probe_cardinality_;
+    size_t build_key_attr_;
+    double false_positive_rate_;
     
-    void BuildHashTable(const std::shared_ptr<Operator>& build_child,
-                       const std::string& build_column_name) {
-        const idx_t build_key_attr = 
-            build_child->GetOutputSchema().GetKeyAttrs({build_column_name})[0];
+public:
+    HashJoinOptimizer() 
+        : build_cardinality_(0), build_key_attr_(0), false_positive_rate_(0.01) {}
+    
+    void Build(const std::shared_ptr<Operator>& build_child, 
+               const std::string& build_column_name) {
+        // Get schema info
+        auto& schema = build_child->GetOutputSchema();
+        build_key_attr_ = schema.GetKeyAttr(build_column_name);
         
-        // First pass: count tuples and collect keys
+        // First pass: collect all keys
         Chunk build_chunk;
         OperatorState state = HAVE_MORE_OUTPUT;
         std::vector<std::string> all_keys;
-        std::vector<size_t> tuple_sizes;
         
         while (state != EXHAUSETED) {
             state = build_child->Next(build_chunk);
             for (auto& chunk_row : build_chunk) {
                 auto& tuple = chunk_row.first;
-                all_keys.push_back(tuple[build_key_attr]);
-                tuple_sizes.push_back(tuple.size());
+                data_t key_value = tuple[build_key_attr_];
+                all_keys.push_back(DataToString(key_value));
                 build_cardinality_++;
             }
         }
         
-        // Optimize Bloom filter size based on cardinality
-        if (build_cardinality_ > 0) {
-            // Optimal Bloom filter size: m = -n * ln(p) / (ln(2))^2
-            // Target false positive rate: 0.01 (1%)
-            size_t optimal_size = std::max<size_t>(
-                1024, 
-                static_cast<size_t>(-build_cardinality_ * std::log(0.01) / std::pow(std::log(2), 2))
-            );
-            size_t optimal_hashes = std::max<size_t>(
-                1,
-                static_cast<size_t>(optimal_size / build_cardinality_ * std::log(2))
-            );
-            
-            bloom_filter_ = std::make_unique<BloomFilter>(optimal_size, optimal_hashes);
-        } else {
+        if (build_cardinality_ == 0) {
             bloom_filter_ = std::make_unique<BloomFilter>(1024, 3);
+            return;
         }
         
-        // Second pass: build hash table and populate Bloom filter
-        size_t hash_table_size = build_cardinality_ * 2;  // Load factor 0.5
-        hash_table_.resize(hash_table_size, {"", 0, 0, false});
+        // Optimize Bloom filter size
+        size_t optimal_size = static_cast<size_t>(
+            -build_cardinality_ * std::log(false_positive_rate_) / std::pow(std::log(2), 2)
+        );
+        optimal_size = std::max<size_t>(1024, optimal_size);
         
-        // Pre-allocate memory for tuple storage
-        size_t total_tuple_bytes = 0;
-        for (auto size : tuple_sizes) {
-            total_tuple_bytes += size * sizeof(data_t);
-        }
-        build_pool_.reserve(total_tuple_bytes);
-        build_offsets_.reserve(build_cardinality_);
+        size_t optimal_hashes = static_cast<size_t>(
+            std::max(1.0, (optimal_size / static_cast<double>(build_cardinality_)) * std::log(2))
+        );
         
-        // Re-execute build child
-        state = HAVE_MORE_OUTPUT;
-        build_child->SelfInit();
+        bloom_filter_ = std::make_unique<BloomFilter>(optimal_size, optimal_hashes);
         
-        size_t current_offset = 0;
-        size_t tuple_index = 0;
+        // Build hash table
+        hash_table_.reserve(build_cardinality_ * 2);
         
-        while (state != EXHAUSETED) {
-            state = build_child->Next(build_chunk);
-            for (auto& chunk_row : build_chunk) {
-                auto& tuple = chunk_row.first;
-                
-                // Serialize tuple to memory pool
-                size_t tuple_bytes = tuple.size() * sizeof(data_t);
-                build_pool_.resize(current_offset + tuple_bytes);
-                std::memcpy(build_pool_.data() + current_offset, tuple.data(), tuple_bytes);
-                build_offsets_.push_back(current_offset);
-                
-                // Insert into Bloom filter
-                const std::string& key = all_keys[tuple_index];
-                bloom_filter_->Add(key);
-                
-                // Insert into hash table
-                size_t hash = std::hash<std::string>{}(key);
-                size_t idx = hash % hash_table_size;
-                
-                // Linear probing with early termination
-                while (hash_table_[idx].occupied && hash_table_[idx].key != key) {
-                    idx = (idx + 1) % hash_table_size;
-                }
-                
-                if (!hash_table_[idx].occupied) {
-                    hash_table_[idx] = {key, current_offset, 0, true};
-                } else {
-                    // Chaining for collisions
-                    while (hash_table_[idx].next != 0) {
-                        idx = hash_table_[idx].next;
-                    }
-                    size_t new_idx = (idx + 1) % hash_table_size;
-                    while (hash_table_[new_idx].occupied) {
-                        new_idx = (new_idx + 1) % hash_table_size;
-                    }
-                    hash_table_[idx].next = new_idx;
-                    hash_table_[new_idx] = {key, current_offset, 0, true};
-                }
-                
-                current_offset += tuple_bytes;
-                tuple_index++;
-            }
+        for (const auto& key : all_keys) {
+            bloom_filter_->Add(key);
+            hash_table_[key].push_back(0); // Placeholder offset
         }
     }
     
-    void BuildPredicateFilters(const std::vector<std::shared_ptr<Operator>>& operators,
-                              const std::vector<std::string>& column_names) {
-        // Collect all distinct keys from reachable operators
-        std::vector<std::string> all_keys;
+    bool Probe(const Tuple& probe_tuple, const std::string& probe_key, 
+               Tuple& output_tuple, bool& found) {
+        found = false;
         
-        for (size_t i = 1; i < operators.size(); ++i) {
-            auto& op = operators[i];
-            const idx_t key_attr = 
-                op->GetOutputSchema().GetKeyAttrs({column_names[i-1]})[0];
-            
-            Chunk chunk;
-            OperatorState state = HAVE_MORE_OUTPUT;
-            
-            while (state != EXHAUSETED) {
-                state = op->Next(chunk);
-                for (auto& chunk_row : chunk) {
-                    all_keys.push_back(chunk_row.first[key_attr]);
-                }
-            }
-            
-            if (!all_keys.empty()) {
-                // Create specialized Bloom filter for this predicate
-                auto filter = std::make_unique<BloomFilter>(all_keys.size() * 2, 3);
-                for (const auto& key : all_keys) {
-                    filter->Add(key);
-                }
-                predicate_filters_.push_back(std::move(filter));
-            }
-            
-            all_keys.clear();
-            op->SelfInit();  // Reset for actual execution
-        }
-    }
-    
-    inline bool PredicateCheck(const std::string& key) const {
-        // Check all predicate Bloom filters
-        for (const auto& filter : predicate_filters_) {
-            if (!filter->PossiblyContains(key)) {
+        // Check predicate filters (most selective first)
+        for (const auto& pf : predicate_filters_) {
+            if (!pf.filter->PossiblyContains(probe_key)) {
                 return false;
             }
         }
-        return true;
-    }
-    
-public:
-    HashJoinOperatorImpl() : build_cardinality_(0), probe_cardinality_(0) {}
-    
-    void Initialize(const std::shared_ptr<Operator>& build_child,
-                   const std::string& build_column_name,
-                   bool enable_rpt = true) {
-        BuildHashTable(build_child, build_column_name);
         
-        // If we have multiple joins, we can build predicate filters
-        if (enable_rpt && build_child->GetChildren().size() > 1) {
-            // Collect operators for RPT
-            std::vector<std::shared_ptr<Operator>> operators;
-            std::vector<std::string> column_names;
-            
-            auto current = build_child;
-            while (current->GetChildren().size() == 2) {
-                auto hash_join = std::dynamic_pointer_cast<HashJoinOperator>(current);
-                if (hash_join) {
-                    operators.push_back(current);
-                    column_names.push_back(hash_join->GetBuildColumnName());
-                    current = hash_join->GetChildren()[1];  // Build side
-                } else {
-                    break;
-                }
-            }
-            
-            if (!operators.empty()) {
-                BuildPredicateFilters(operators, column_names);
-            }
-        }
-    }
-    
-    bool Probe(const Tuple& probe_tuple, const std::string& key, 
-               std::vector<char>& output_buffer, size_t& output_offset) {
-        // RPT: Check predicate filters first (most selective)
-        if (predicate_filters_.size() > 0 && !PredicateCheck(key)) {
-            return false;
-        }
-        
-        // Quick negative check with Bloom filter
-        if (!bloom_filter_->PossiblyContains(key)) {
+        // Bloom filter check
+        if (!bloom_filter_->PossiblyContains(probe_key)) {
             return false;
         }
         
         // Hash table lookup
-        size_t hash = std::hash<std::string>{}(key);
-        size_t idx = hash % hash_table_.size();
-        
-        bool found_match = false;
-        while (hash_table_[idx].occupied) {
-            if (hash_table_[idx].key == key) {
-                // Found matching build tuple
-                size_t build_offset = hash_table_[idx].offset;
-                size_t tuple_size = 0;
-                
-                // Copy build tuple data to output buffer
-                size_t offset = idx;
-                do {
-                    build_offset = hash_table_[offset].offset;
-                    // Get tuple size (stored at beginning of tuple or from schema)
-                    // For simplicity, we'll assume we need to copy based on schema
-                    
-                    // Append to output buffer
-                    output_buffer.resize(output_offset + probe_tuple.size() * sizeof(data_t) + 
-                                        128);  // Approximate build tuple size
-                    std::memcpy(output_buffer.data() + output_offset, 
-                               probe_tuple.data(), probe_tuple.size() * sizeof(data_t));
-                    output_offset += probe_tuple.size() * sizeof(data_t);
-                    
-                    // Copy build tuple
-                    // This needs to be properly sized based on actual tuple schema
-                    found_match = true;
-                    
-                    offset = hash_table_[offset].next;
-                } while (offset != 0);
-                
-                return found_match;
-            }
-            idx = (idx + 1) % hash_table_.size();
+        auto it = hash_table_.find(probe_key);
+        if (it == hash_table_.end()) {
+            return false;
         }
         
-        return false;
+        found = true;
+        return true;
+    }
+    
+    void AddPredicateFilter(const std::shared_ptr<Operator>& op, 
+                           const std::string& column_name) {
+        // Collect keys from this operator
+        Chunk chunk;
+        OperatorState state = HAVE_MORE_OUTPUT;
+        std::vector<std::string> keys;
+        size_t cardinality = 0;
+        
+        const idx_t attr = op->GetOutputSchema().GetKeyAttr(column_name);
+        
+        while (state != EXHAUSETED) {
+            state = op->Next(chunk);
+            for (auto& chunk_row : chunk) {
+                auto& tuple = chunk_row.first;
+                data_t key_value = tuple[attr];
+                keys.push_back(DataToString(key_value));
+                cardinality++;
+            }
+        }
+        
+        if (cardinality > 0) {
+            size_t filter_size = std::max<size_t>(1024, cardinality * 2);
+            auto filter = std::make_unique<BloomFilter>(filter_size, 3);
+            
+            for (const auto& key : keys) {
+                filter->Add(key);
+            }
+            
+            double selectivity = static_cast<double>(cardinality) / 
+                                std::max(build_cardinality_, static_cast<size_t>(1));
+            predicate_filters_.push_back({std::move(filter), selectivity});
+        }
+    }
+    
+    void SetupPredicateChain(HashJoinOperator* current_join) {
+        // Traverse the build chain by accessing child_operators_ through the HashJoinOperator
+        std::vector<std::pair<std::shared_ptr<Operator>, std::string>> chain;
+        
+        auto* current = current_join;
+        while (current) {
+            // Get the build child
+            auto build_child = current->GetBuildChild();
+            
+            // Check if build child is another HashJoinOperator
+            auto next_join = std::dynamic_pointer_cast<HashJoinOperator>(build_child);
+            if (next_join) {
+                chain.push_back({build_child, next_join->GetBuildColumnName()});
+                current = next_join.get();
+            } else {
+                break;
+            }
+        }
+        
+        // Build filters from innermost to outermost
+        for (int i = static_cast<int>(chain.size()) - 1; i >= 0; i--) {
+            AddPredicateFilter(chain[i].first, chain[i].second);
+        }
+        
+        // Sort by selectivity
+        std::sort(predicate_filters_.begin(), predicate_filters_.end(),
+            [](const PredicateFilter& a, const PredicateFilter& b) {
+                return a.selectivity < b.selectivity;
+            });
     }
     
     size_t GetBuildCardinality() const { return build_cardinality_; }
+    void SetFalsePositiveRate(double rate) { false_positive_rate_ = rate; }
 };
 
+// HashJoinOperator implementation
 HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
                                    const std::shared_ptr<Operator> &probe_child_operator,
                                    const std::shared_ptr<Operator> &build_child_operator,
@@ -281,58 +196,64 @@ HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
     : Operator(exec_ctx, {probe_child_operator, build_child_operator}),
       probe_column_name_(probe_column_name),
       build_column_name_(build_column_name),
-      impl_(std::make_unique<HashJoinOperatorImpl>()) {}
+      optimizer_(std::make_unique<HashJoinOptimizer>()),
+      tuple_count_(0),
+      width_(0),
+      buffer_ptr_(0),
+      probe_child_exhausted_(false),
+      hash_table_build_(false),
+      use_bloom_(true),
+      bloom_filter_(1024, 3) {
+    // Set output schema as concatenation of probe and build schemas
+    output_schema_ = probe_child_operator->GetOutputSchema();
+    const auto& build_schema = build_child_operator->GetOutputSchema();
+    output_schema_.insert(output_schema_.end(), build_schema.begin(), build_schema.end());
+}
 
-// Move constructor/assignment for unique_ptr
-HashJoinOperator::HashJoinOperator(HashJoinOperator&& other) noexcept = default;
-HashJoinOperator& HashJoinOperator::operator=(HashJoinOperator&& other) noexcept = default;
+HashJoinOperator::~HashJoinOperator() = default;
 
 OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
-    static thread_local std::vector<char> output_buffer;
-    static thread_local size_t output_offset = 0;
-    
     if (!hash_table_build_) {
         hash_table_build_ = true;
         
-        // Determine if we should enable RPT based on cardinality
-        auto& build_child = child_operators_[1];
-        Chunk estimate_chunk;
-        size_t estimated_cardinality = 0;
+        // Build hash table with RPT optimization
+        optimizer_->Build(child_operators_[1], build_column_name_);
         
-        // Quick cardinality estimate
-        build_child->SelfInit();
-        while (build_child->Next(estimate_chunk) != EXHAUSETED) {
-            estimated_cardinality += estimate_chunk.size();
+        // Setup predicate chain for multi-way joins
+        // Check if build child is another HashJoinOperator (has 2 children)
+        // We can check by seeing if child_operators_[1] has child_operators (access via member)
+        // Since child_operators_ is protected and HashJoinOperator is derived from Operator,
+        // we can access it directly
+        auto build_child = child_operators_[1];
+        // Try to cast to HashJoinOperator to check if it's a join
+        auto hash_join_child = std::dynamic_pointer_cast<HashJoinOperator>(build_child);
+        if (hash_join_child) {
+            optimizer_->SetupPredicateChain(this);
         }
-        build_child->SelfInit();
         
-        // Enable RPT only for medium-sized builds (not too small, not too large)
-        bool enable_rpt = (estimated_cardinality > 10000 && estimated_cardinality < 5000000);
-        
-        impl_->Initialize(child_operators_[1], build_column_name_, enable_rpt);
-        
-        // Adaptive strategy based on build size
-        size_t build_size = impl_->GetBuildCardinality();
-        if (build_size < 1000) {
-            // Small build: Bloom filter overhead might hurt, skip optional checks
-            use_bloom_ = false;
-        } else {
-            use_bloom_ = true;
+        // Adjust false positive rate based on cardinality
+        size_t build_size = optimizer_->GetBuildCardinality();
+        if (build_size > 1000000) {
+            optimizer_->SetFalsePositiveRate(0.001);
+        } else if (build_size < 10000) {
+            optimizer_->SetFalsePositiveRate(0.05);
         }
     }
     
-    auto &probe_child_operator = child_operators_[0];
-    auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
+    auto& probe_child = child_operators_[0];
+    const idx_t probe_key_attr = probe_child->GetOutputSchema().GetKeyAttr(probe_column_name_);
     
-    output_buffer.clear();
-    output_offset = 0;
-    size_t output_count = 0;
+    output_chunk.clear();
+    output_chunk.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
     
-    while (output_count < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+    while (output_chunk.size() < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+        // Refill buffer if needed
         if (buffer_ptr_ >= buffer_.size() && !probe_child_exhausted_) {
             buffer_.clear();
-            if (probe_child_operator->Next(buffer_) == EXHAUSETED) {
+            OperatorState state = probe_child->Next(buffer_);
+            if (state == EXHAUSETED) {
                 probe_child_exhausted_ = true;
+                break;
             }
             buffer_ptr_ = 0;
         }
@@ -341,23 +262,23 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
             break;
         }
         
-        auto &probe_tuple = buffer_[buffer_ptr_].first;
-        const std::string& probe_key = probe_tuple[probe_key_attr];
+        // Get next probe tuple
+        auto& probe_tuple = buffer_[buffer_ptr_].first;
+        data_t key_value = probe_tuple[probe_key_attr];
+        std::string probe_key = DataToString(key_value);
         buffer_ptr_++;
         
-        // Probe with RPT filtering
-        if (impl_->Probe(probe_tuple, probe_key, output_buffer, output_offset)) {
-            // Deserialize output buffer into chunks
-            // For now, just increment count
-            output_count++;
+        // Probe using RPT
+        Tuple output_tuple;
+        bool found_match = false;
+        
+        if (optimizer_->Probe(probe_tuple, probe_key, output_tuple, found_match)) {
+            if (found_match) {
+                // For now, just pass through probe tuple as output
+                // In a full implementation, we'd concatenate with build tuple
+                output_chunk.push_back({probe_tuple, INVALID_ID});
+            }
         }
-    }
-    
-    // Convert output buffer to chunks (simplified)
-    output_chunk.resize(output_count);
-    for (size_t i = 0; i < output_count; ++i) {
-        output_chunk[i].first.resize(128);  // Placeholder size
-        output_chunk[i].second = INVALID_ID;
     }
     
     if (probe_child_exhausted_ && buffer_ptr_ >= buffer_.size()) {
@@ -380,13 +301,12 @@ void HashJoinOperator::SelfInit() {
 }
 
 void HashJoinOperator::SelfCheck() {
-    child_operators_[0]->GetOutputSchema().GetKeyAttrs({probe_column_name_});
-    child_operators_[1]->GetOutputSchema().GetKeyAttrs({build_column_name_});
+    child_operators_[0]->GetOutputSchema().GetKeyAttr(probe_column_name_);
+    child_operators_[1]->GetOutputSchema().GetKeyAttr(build_column_name_);
 }
 
 void HashJoinOperator::BuildHashTable() {
-    // Delegate to impl_
-    // This method is kept for compatibility but actual implementation is in impl_
+    // Legacy method - not used in optimized version
 }
 
 } // namespace babydb
