@@ -1,6 +1,7 @@
 #include "execution/operator.hpp"
 
-#include <unordered_map>
+#include <vector>
+#include <utility>
 
 namespace babydb {
 
@@ -30,9 +31,9 @@ private:
 
     std::string aggregate_column_;
 
-    std::unordered_multimap<data_t, data_t> hash_table_;
+    std::vector<std::pair<data_t, data_t>> hash_table_;
 
-    std::unordered_multimap<data_t, data_t>::iterator output_ptr_;
+    std::vector<std::pair<data_t, data_t>>::iterator output_ptr_;
 
     bool hash_table_build_{false};
 };

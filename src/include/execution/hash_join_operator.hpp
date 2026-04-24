@@ -4,6 +4,8 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
+#include <utility>
 
 namespace babydb {
 
@@ -42,7 +44,7 @@ private:
 
     idx_t width_;
 
-    std::unordered_multimap<data_t, idx_t> pointer_table_;
+    std::vector<std::pair<data_t, idx_t>> pointer_table_;
 
     Chunk buffer_;
 
