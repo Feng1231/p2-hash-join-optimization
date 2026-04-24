@@ -4,13 +4,13 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace babydb {
 
 /**
- * Hash Join Operator
- * We only support equavilant join on one column.
- * The output schema is just the union of the input's schema.
+ * Hash Join Operator with Columnar Output
+ * Stores results in columnar format to reduce tuple copying
  */
 class HashJoinOperator : public Operator {
 public:
@@ -30,27 +30,30 @@ public:
 
 private:
     void BuildHashTable();
+    
+    // Convert columnar output to chunk format
+    void FlushColumnarToChunk(Chunk &output_chunk);
 
 private:
     std::string probe_column_name_;
-
     std::string build_column_name_;
 
-    std::vector<data_t> tuples_;
-
+    std::vector<data_t> tuples_;  // Flattened build tuples
     idx_t tuple_count_;
-
     idx_t width_;
 
     std::unordered_multimap<data_t, idx_t> pointer_table_;
 
     Chunk buffer_;
-
     idx_t buffer_ptr_;
-
     bool probe_child_exhausted_;
-
     bool hash_table_build_;
+    
+    // Columnar output buffers
+    std::vector<std::vector<data_t>> columnar_output_;  // Each column is a vector
+    std::vector<idx_t> columnar_row_count_;
+    idx_t num_output_columns_;
+    bool use_columnar_;
 };
 
 }
