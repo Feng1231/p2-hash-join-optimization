@@ -49,15 +49,27 @@ ProjectionOperator::ProjectionOperator(const ExecutionContext &exec_ctx,
     : ProjectionOperator(exec_ctx, probe_child_operator, TransToVec(std::move(projection)), update_in_place) {}
 
 OperatorState ProjectionOperator::Next(Chunk &output_chunk) {
-    auto result = child_operators_[0]->Next(output_chunk);
-    for (auto &data : output_chunk) {
+    // Reuse input chunk buffer
+    Chunk& input_chunk = reusable_input_chunk_;
+    input_chunk.clear();
+    
+    auto result = child_operators_[0]->Next(input_chunk);
+    
+    // Move data from input to output (avoid copy)
+    output_chunk.clear();
+    output_chunk.reserve(input_chunk.size());
+    
+    for (auto &data : input_chunk) {
         auto &old_tuple = data.first;
         Tuple new_tuple;
+        new_tuple.reserve(projections_.size());
+        
         for (auto &projection_function : projections_) {
             new_tuple.push_back(projection_function->Calc(old_tuple));
         }
-        old_tuple = new_tuple;
+        output_chunk.emplace_back(std::move(new_tuple), data.second);
     }
+    
     return result;
 }
 

@@ -21,8 +21,13 @@ FilterOperator::FilterOperator(const ExecutionContext &exec_ctx,
 
 OperatorState FilterOperator::Next(Chunk &output_chunk) {
     output_chunk.clear();
-    Chunk input_chunk;
+    
+    // Reuse the same input chunk across calls - no allocation each time
+    Chunk& input_chunk = reusable_input_chunk_;
+    input_chunk.clear();
+    
     auto result = child_operators_[0]->Next(input_chunk);
+    
     for (auto &data : input_chunk) {
         bool pass_tag = true;
         for (auto &filter : filters_) {

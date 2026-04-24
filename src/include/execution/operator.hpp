@@ -58,10 +58,17 @@ public:
     }
 
     virtual std::string BindTableName() { return INVALID_NAME; }
+    
+    // Allow operators to reset their internal state for reuse
+    virtual void Reset() {
+        for (auto &child_operator : child_operators_) {
+            child_operator->Reset();
+        }
+        SelfInit();
+    }
 
 protected:
     virtual void SelfInit() = 0;
-
     virtual void SelfCheck() = 0;
 
     void CheckSchema() {
@@ -76,10 +83,12 @@ protected:
 
 protected:
     ExecutionContext exec_ctx_;
-
     std::vector<std::shared_ptr<Operator>> child_operators_;
-
     Schema output_schema_;
+    
+    // Reusable chunk buffers for zero-copy between operators
+    Chunk reusable_input_chunk_;
+    Chunk reusable_output_chunk_;
 };
 
 }
