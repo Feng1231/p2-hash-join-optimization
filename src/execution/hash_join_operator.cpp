@@ -1,4 +1,5 @@
 #include "execution/hash_join_operator.hpp"
+#include "execution/bloom_filter.hpp"
 
 #include "common/config.hpp"
 
@@ -43,6 +44,12 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
 
         auto &probe_tuple = buffer_[buffer_ptr_].first;
         buffer_ptr_++;
+
+        // Bloom filter check
+        if (!bloom_filter_.PossiblyContains(probe_tuple[probe_key_attr])) {
+            continue; // Skip non-matching tuples
+        }
+
         auto match_range = pointer_table_.equal_range(probe_tuple.KeyFromTuple(probe_key_attr));
         for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
             if (output_size == output_chunk.size()) {
@@ -81,20 +88,30 @@ void HashJoinOperator::BuildHashTable() {
     OperatorState state = HAVE_MORE_OUTPUT;
     Chunk build_chunk;
     const idx_t build_key_attr = build_child_operator->GetOutputSchema().GetKeyAttrs({build_column_name_})[0];
+
+    // Initialize Bloom filter
+    BloomFilter bloom_filter(1024 * 1024, 3); // Example size and hash count
+
     while (state != EXHAUSETED) {
         state = build_child_operator->Next(build_chunk);
         for (auto &chunk_row : build_chunk) {
             auto &tuple = chunk_row.first;
             tuples_.insert(tuples_.end(), tuple.begin(), tuple.end());
             tuple_count_++;
+
+            // Add build-side keys to Bloom filter
+            bloom_filter.Add(tuple[build_key_attr]);
         }
     }
-    // Since usually build side is much smaller than probe side, we reserve much more number of tuples
-    // to reduce the probe complexity
+
+    // Reserve space for hash table
     pointer_table_.reserve(tuple_count_ * 4);
     for (idx_t i = 0; i < tuple_count_; i++) {
         pointer_table_.insert(std::make_pair(tuples_[i * width_ + build_key_attr], i * width_));
     }
+
+    // Store Bloom filter for probe phase
+    bloom_filter_ = std::move(bloom_filter);
 }
 
 }
