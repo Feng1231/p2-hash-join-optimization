@@ -19,6 +19,8 @@ static Tuple UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &sta
     return result;
 }
 
+// In hash_join_operator.cpp - replace the existing Next() with this version
+
 OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
     idx_t output_size = 0;
 
@@ -28,9 +30,10 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
     }
 
     output_chunk.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
-
+    
     auto &probe_child_operator = child_operators_[0];
     auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
+    
     while (output_size < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
         if (buffer_ptr_ == buffer_.size() && !probe_child_exhausted_) {
             if (probe_child_operator->Next(buffer_) == EXHAUSETED) {
@@ -46,13 +49,26 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         auto &probe_tuple = buffer_[buffer_ptr_].first;
         buffer_ptr_++;
         auto match_range = pointer_table_.equal_range(probe_tuple.KeyFromTuple(probe_key_attr));
+        
         for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
             if (output_size == output_chunk.size()) {
-                output_chunk.push_back(
-                    std::make_pair(UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_)
-                    , INVALID_ID));
+                // Direct construction without UnionTuple function call
+                output_chunk.emplace_back();
+                auto &new_tuple = output_chunk.back().first;
+                new_tuple = probe_tuple;
+                new_tuple.reserve(new_tuple.size() + width_);
+                new_tuple.insert(new_tuple.end(), 
+                               tuples_.begin() + match_ite->second,
+                               tuples_.begin() + match_ite->second + width_);
+                output_chunk.back().second = INVALID_ID;
             } else {
-                output_chunk[output_size].first = UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_);
+                // Reuse existing entry
+                output_chunk[output_size].first = probe_tuple;
+                output_chunk[output_size].first.reserve(output_chunk[output_size].first.size() + width_);
+                output_chunk[output_size].first.insert(
+                    output_chunk[output_size].first.end(),
+                    tuples_.begin() + match_ite->second,
+                    tuples_.begin() + match_ite->second + width_);
                 output_chunk[output_size].second = INVALID_ID;
             }
             output_size++;
