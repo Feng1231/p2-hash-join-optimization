@@ -16,12 +16,11 @@ HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
       width_(0),
       probe_chunk_pos_(0),
       probe_child_exhausted_(false),
-      hash_table_build_(false) {
-    // Pre-reserve reasonable capacity for temp buffer
-    temp_buffer_.reserve(256);
-}
+      hash_table_build_(false) {}
 
 OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
+    output_chunk.clear();
+    
     if (!hash_table_build_) {
         hash_table_build_ = true;
         BuildHashTable();
@@ -30,22 +29,20 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
     auto &probe_child_operator = child_operators_[0];
     auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
     
-    // Reserve capacity in output chunk to avoid repeated resizing
-    output_chunk.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
-    
     while (output_chunk.size() < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
-        // Refill probe chunk if needed
-        if (probe_chunk_pos_ >= probe_chunk_.size() && !probe_child_exhausted_) {
+        // Refill probe chunk if we've exhausted current one
+        if (probe_chunk_pos_ >= probe_chunk_.size()) {
+            if (probe_child_exhausted_) {
+                break;  // No more data from probe child
+            }
+            
             probe_chunk_.clear();
-            if (probe_child_operator->Next(probe_chunk_) == EXHAUSETED) {
+            OperatorState child_state = probe_child_operator->Next(probe_chunk_);
+            if (child_state == EXHAUSETED) {
                 probe_child_exhausted_ = true;
+                break;
             }
             probe_chunk_pos_ = 0;
-        }
-        
-        // Check if we're done
-        if (probe_chunk_pos_ >= probe_chunk_.size()) {
-            return EXHAUSETED;
         }
         
         // Get current probe tuple (by reference, no copy)
@@ -59,34 +56,29 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         auto match_range = pointer_table_.equal_range(probe_key);
         
         for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
-            // Build output tuple directly in output_chunk without temporary
-            // This eliminates the UnionTuple temporary creation
-            
-            if (output_chunk.size() == output_chunk.capacity()) {
-                // If we're at capacity, break to return current batch
+            if (output_chunk.size() >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
                 break;
             }
             
-            // Add new entry to output chunk
+            // Build output tuple directly in output_chunk without temporary UnionTuple
             output_chunk.emplace_back();
             auto &output_entry = output_chunk.back();
             auto &output_tuple = output_entry.first;
             output_entry.second = INVALID_ID;
             
-            // Construct output tuple efficiently:
-            // 1. First copy probe tuple (must copy since we need to own the data)
+            // Copy probe tuple
             output_tuple = probe_tuple;
             
-            // 2. Reserve space for build tuple to avoid multiple reallocations
+            // Reserve space to avoid reallocation during insert
             output_tuple.reserve(output_tuple.size() + width_);
             
-            // 3. Append build tuple data directly
+            // Append build tuple data directly
             auto build_start = tuples_.begin() + match_ite->second;
             output_tuple.insert(output_tuple.end(), build_start, build_start + width_);
         }
     }
     
-    return HAVE_MORE_OUTPUT;
+    return output_chunk.empty() ? EXHAUSETED : HAVE_MORE_OUTPUT;
 }
 
 void HashJoinOperator::SelfInit() {
@@ -98,7 +90,6 @@ void HashJoinOperator::SelfInit() {
     probe_chunk_pos_ = 0;
     probe_child_exhausted_ = false;
     hash_table_build_ = false;
-    temp_buffer_.clear();
 }
 
 void HashJoinOperator::SelfCheck() {
@@ -130,7 +121,7 @@ void HashJoinOperator::BuildHashTable() {
     for (idx_t i = 0; i < tuple_count_; i++) {
         idx_t offset = i * width_;
         data_t key = tuples_[offset + build_key_attr];
-        pointer_table_.emplace(key, offset);  // Use emplace instead of make_pair
+        pointer_table_.emplace(key, offset);
     }
 }
 

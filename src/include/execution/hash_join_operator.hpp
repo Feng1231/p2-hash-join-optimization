@@ -10,7 +10,6 @@ namespace babydb {
 
 /**
  * Hash Join Operator with Zero-Copy Optimization
- * Reduces unnecessary tuple copying by reusing buffers and eliminating temporaries
  */
 class HashJoinOperator : public Operator {
 public:
@@ -48,9 +47,6 @@ private:
     size_t probe_chunk_pos_;
     bool probe_child_exhausted_;
     bool hash_table_build_;
-    
-    // Reusable temporary tuple buffer to avoid allocations during output construction
-    std::vector<data_t> temp_buffer_;
 };
 
 }
