@@ -4,12 +4,6 @@
 
 namespace babydb {
 
-/**
- * Sequential Scan Operator
- * By default, it will use "<table name>.<column name>" as output schema.
- * You can also manually specify the table name in output schema.
- * Or specify the output schema.
- */
 class SeqScanOperator : public Operator {
 public:
     SeqScanOperator(const ExecutionContext &exec_ctx, const std::string &table_name);
@@ -34,10 +28,11 @@ public:
 
 private:
     std::string table_name_;
-
     Schema fetch_columns_;
-
     idx_t next_row_id{0};
+    
+    // Reusable chunk buffer
+    Chunk reusable_buffer_;
 };
 
 }
