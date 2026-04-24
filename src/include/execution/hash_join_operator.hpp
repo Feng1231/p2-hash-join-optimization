@@ -4,13 +4,12 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace babydb {
 
 /**
- * Hash Join Operator
- * We only support equavilant join on one column.
- * The output schema is just the union of the input's schema.
+ * Hash Join Operator with Batch Output Optimization
  */
 class HashJoinOperator : public Operator {
 public:
@@ -30,27 +29,34 @@ public:
 
 private:
     void BuildHashTable();
+    
+    // Batch output helper
+    void FlushBatchOutput(Chunk &output_chunk, idx_t &output_size);
 
 private:
     std::string probe_column_name_;
-
     std::string build_column_name_;
 
     std::vector<data_t> tuples_;
-
     idx_t tuple_count_;
-
     idx_t width_;
 
     std::unordered_multimap<data_t, idx_t> pointer_table_;
 
     Chunk buffer_;
-
     idx_t buffer_ptr_;
-
     bool probe_child_exhausted_;
-
     bool hash_table_build_;
+    
+    // Batch output buffers
+    static constexpr idx_t BATCH_SIZE = 1024;
+    std::vector<data_t> output_buffer_;  // Contiguous data for multiple tuples
+    std::vector<idx_t> output_offsets_;  // Offsets into output_buffer_
+    std::vector<idx_t> output_row_ids_;  // Row IDs for each output tuple
+    idx_t current_batch_count_;
+    
+    // Reusable temporary buffer for building output
+    std::vector<data_t> temp_tuple_buffer_;
 };
 
 }
