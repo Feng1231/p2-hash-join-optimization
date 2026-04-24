@@ -1,4 +1,3 @@
-// hash_join_operator.hpp
 #pragma once
 
 #include "execution/operator.hpp"
@@ -13,8 +12,7 @@ namespace babydb {
  * Optimized Hash Join Operator
  * Improvements:
  * 1. Columnar storage for build side to reduce copying
- * 2. Cache-friendly hash table with separate chaining
- * 3. Pre-allocated memory pools
+ * 2. Replace unordered_multimap with map of vectors for better cache locality
  */
 class HashJoinOperator : public Operator {
 public:
@@ -24,28 +22,15 @@ public:
         idx_t tuple_count{0};
         idx_t width{0};
         
-        void reserve(idx_t capacity, idx_t col_width) {
-            width = col_width;
-            columns.resize(col_width);
-            for (auto& col : columns) {
-                col.reserve(capacity);
-            }
-        }
-        
         void add_tuple(const Tuple& tuple) {
+            if (columns.empty()) {
+                width = tuple.size();
+                columns.resize(width);
+            }
             for (idx_t i = 0; i < width; i++) {
                 columns[i].push_back(tuple[i]);
             }
             tuple_count++;
-        }
-        
-        Tuple get_tuple(idx_t index) const {
-            Tuple result;
-            result.reserve(width);
-            for (idx_t i = 0; i < width; i++) {
-                result.push_back(columns[i][index]);
-            }
-            return result;
         }
         
         void clear() {
@@ -76,10 +61,10 @@ private:
     std::string probe_column_name_;
     std::string build_column_name_;
     
-    // Optimized storage: columnar format
+    // Columnar storage for build side (cache-friendly)
     ColumnarStorage build_storage_;
     
-    // Cache-friendly hash table: key -> list of tuple indices
+    // Hash table: key -> list of tuple indices (replaces unordered_multimap)
     std::unordered_map<data_t, std::vector<idx_t>> hash_table_;
     
     // Probe state
