@@ -13,9 +13,9 @@ HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
       probe_column_name_(probe_column_name),
       build_column_name_(build_column_name) {}
 
-static Tuple UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &start, idx_t width) {
-    Tuple result = a;
-    result.insert(result.end(), start, start + width);
+static Tuple* UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &start, idx_t width) {
+    auto *result = new Tuple(a); // Allocate on heap
+    result->insert(result->end(), start, start + width);
     return result;
 }
 
@@ -47,10 +47,10 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
             if (output_size == output_chunk.size()) {
                 output_chunk.push_back(
-                    std::make_pair(UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_)
+                    std::make_pair(*UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_)
                     , INVALID_ID));
             } else {
-                output_chunk[output_size].first = UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_);
+                output_chunk[output_size].first = *UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_);
                 output_chunk[output_size].second = INVALID_ID;
             }
             output_size++;
