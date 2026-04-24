@@ -1,5 +1,4 @@
 #include "execution/hash_join_operator.hpp"
-
 #include "common/config.hpp"
 
 namespace babydb {
@@ -13,88 +12,137 @@ HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
       probe_column_name_(probe_column_name),
       build_column_name_(build_column_name) {}
 
-static Tuple UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &start, idx_t width) {
-    Tuple result = a;
-    result.insert(result.end(), start, start + width);
-    return result;
+// Optimized: Output without copying tuples
+static void EmitJoinedTuple(const Tuple& probe_tuple, 
+                            const HashJoinOperator::ColumnarStorage& build_storage,
+                            idx_t build_idx,
+                            Tuple& output) {
+    // Reuse output tuple to avoid allocation
+    output.clear();
+    output.reserve(probe_tuple.size() + build_storage.width);
+    
+    // Add probe tuple
+    output.insert(output.end(), probe_tuple.begin(), probe_tuple.end());
+    
+    // Add build tuple from columnar storage
+    for (idx_t i = 0; i < build_storage.width; i++) {
+        output.push_back(build_storage.columns[i][build_idx]);
+    }
 }
 
 OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
-    idx_t output_size = 0;
-
-    if (!hash_table_build_) {
-        hash_table_build_ = true;
+    if (!hash_table_built_) {
+        hash_table_built_ = true;
         BuildHashTable();
     }
 
-    auto &probe_child_operator = child_operators_[0];
-    auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
-    while (output_size < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
-        if (buffer_ptr_ == buffer_.size() && !probe_child_exhausted_) {
-            if (probe_child_operator->Next(buffer_) == EXHAUSETED) {
+    auto& probe_child = child_operators_[0];
+    auto probe_key_attr = probe_child->GetOutputSchema()
+                          .GetKeyAttrs({probe_column_name_})[0];
+    
+    output_chunk.clear();
+    output_chunk.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
+    
+    // Process probe side with batch processing
+    while (output_chunk.size() < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+        // Refill probe buffer if needed
+        if (probe_buffer_ptr_ >= probe_buffer_.size() && !probe_child_exhausted_) {
+            probe_buffer_.clear();
+            OperatorState state = probe_child->Next(probe_buffer_);
+            if (state == EXHAUSETED) {
                 probe_child_exhausted_ = true;
             }
-            buffer_ptr_ = 0;
+            probe_buffer_ptr_ = 0;
         }
-        if (buffer_ptr_ == buffer_.size()) {
-            output_chunk.resize(output_size);
+        
+        // No more data
+        if (probe_buffer_ptr_ >= probe_buffer_.size()) {
             return EXHAUSETED;
         }
-
-        auto &probe_tuple = buffer_[buffer_ptr_].first;
-        buffer_ptr_++;
-        auto match_range = pointer_table_.equal_range(probe_tuple.KeyFromTuple(probe_key_attr));
-        for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
-            if (output_size == output_chunk.size()) {
-                output_chunk.push_back(
-                    std::make_pair(UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_)
-                    , INVALID_ID));
-            } else {
-                output_chunk[output_size].first = UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_);
-                output_chunk[output_size].second = INVALID_ID;
+        
+        // Get next probe tuple
+        auto& probe_entry = probe_buffer_[probe_buffer_ptr_];
+        auto& probe_tuple = probe_entry.first;
+        data_t probe_key = probe_tuple[probe_key_attr];
+        probe_buffer_ptr_++;
+        
+        // Probe hash table
+        auto it = hash_table_.find(probe_key);
+        if (it == hash_table_.end()) {
+            continue;  // No match
+        }
+        
+        // Emit all matches
+        for (idx_t build_idx : it->second) {
+            Tuple output_tuple;
+            EmitJoinedTuple(probe_tuple, build_storage_, build_idx, output_tuple);
+            output_chunk.emplace_back(std::move(output_tuple), INVALID_ID);
+            
+            if (output_chunk.size() >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+                return HAVE_MORE_OUTPUT;
             }
-            output_size++;
         }
     }
-    output_chunk.resize(output_size);
+    
     return HAVE_MORE_OUTPUT;
 }
 
+void HashJoinOperator::BuildHashTable() {
+    auto& build_child = child_operators_[1];
+    auto build_schema = build_child->GetOutputSchema();
+    auto build_key_attr = build_schema.GetKeyAttrs({build_column_name_})[0];
+    
+    // First pass: count tuples for pre-allocation
+    idx_t estimated_tuples = 0;
+    OperatorState state = HAVE_MORE_OUTPUT;
+    Chunk temp_chunk;
+    
+    while (state != EXHAUSETED) {
+        state = build_child->Next(temp_chunk);
+        estimated_tuples += temp_chunk.size();
+        temp_chunk.clear();
+    }
+    
+    // Pre-allocate memory
+    build_storage_.reserve(estimated_tuples * 1.2, build_schema.size());  // 20% extra
+    hash_table_.reserve(estimated_tuples * 1.5);
+    
+    // Reset child for second pass
+    build_child->Init();
+    
+    // Second pass: build hash table
+    state = HAVE_MORE_OUTPUT;
+    while (state != EXHAUSETED) {
+        state = build_child->Next(temp_chunk);
+        
+        for (auto& [tuple, row_id] : temp_chunk) {
+            // Store tuple in columnar format
+            build_storage_.add_tuple(tuple);
+            idx_t tuple_idx = build_storage_.tuple_count - 1;
+            
+            // Get join key
+            data_t join_key = tuple[build_key_attr];
+            
+            // Add to hash table
+            hash_table_[join_key].push_back(tuple_idx);
+        }
+        
+        temp_chunk.clear();
+    }
+}
+
 void HashJoinOperator::SelfInit() {
-    tuple_count_ = 0;
-    width_ = child_operators_[1]->GetOutputSchema().size();
-    tuples_.clear();
-    pointer_table_.clear();
-    buffer_.clear();
-    buffer_ptr_ = 0;
+    build_storage_.clear();
+    hash_table_.clear();
+    probe_buffer_.clear();
+    probe_buffer_ptr_ = 0;
     probe_child_exhausted_ = false;
-    hash_table_build_ = false;
+    hash_table_built_ = false;
 }
 
 void HashJoinOperator::SelfCheck() {
     child_operators_[0]->GetOutputSchema().GetKeyAttrs({probe_column_name_});
     child_operators_[1]->GetOutputSchema().GetKeyAttrs({build_column_name_});
-}
-
-void HashJoinOperator::BuildHashTable() {
-    auto &build_child_operator = child_operators_[1];
-    OperatorState state = HAVE_MORE_OUTPUT;
-    Chunk build_chunk;
-    const idx_t build_key_attr = build_child_operator->GetOutputSchema().GetKeyAttrs({build_column_name_})[0];
-    while (state != EXHAUSETED) {
-        state = build_child_operator->Next(build_chunk);
-        for (auto &chunk_row : build_chunk) {
-            auto &tuple = chunk_row.first;
-            tuples_.insert(tuples_.end(), tuple.begin(), tuple.end());
-            tuple_count_++;
-        }
-    }
-    // Since usually build side is much smaller than probe side, we reserve much more number of tuples
-    // to reduce the probe complexity
-    pointer_table_.reserve(tuple_count_ * 4);
-    for (idx_t i = 0; i < tuple_count_; i++) {
-        pointer_table_.insert(std::make_pair(tuples_[i * width_ + build_key_attr], i * width_));
-    }
 }
 
 }
