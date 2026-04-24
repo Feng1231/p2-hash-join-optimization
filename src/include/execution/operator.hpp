@@ -86,9 +86,7 @@ protected:
     std::vector<std::shared_ptr<Operator>> child_operators_;
     Schema output_schema_;
     
-    // Reusable chunk buffers for zero-copy between operators
-    Chunk reusable_input_chunk_;
-    Chunk reusable_output_chunk_;
+    
 };
 
 }

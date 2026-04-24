@@ -35,6 +35,7 @@ private:
 
 private:
     std::vector<std::unique_ptr<Projection>> projections_;
+    Chunk reusable_input_chunk_;  
 };
 
 }

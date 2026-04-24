@@ -32,6 +32,7 @@ private:
 
 private:
     std::vector<std::unique_ptr<Filter>> filters_;
+    Chunk reusable_input_chunk_;
 };
 
 }
