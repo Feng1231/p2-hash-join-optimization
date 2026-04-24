@@ -13,9 +13,16 @@ HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
       probe_column_name_(probe_column_name),
       build_column_name_(build_column_name) {}
 
+<<<<<<< Updated upstream
 static Tuple UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &start, idx_t width) {
     Tuple result = a;
     result.insert(result.end(), start, start + width);
+=======
+// Update UnionTuple to pointer so no per-tuple copying
+static Tuple* UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &start, idx_t width) {
+    auto *result = new Tuple(a); // Allocate on heap
+    result->insert(result->end(), start, start + width);
+>>>>>>> Stashed changes
     return result;
 }
 
@@ -47,10 +54,19 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
             if (output_size == output_chunk.size()) {
                 output_chunk.push_back(
+<<<<<<< Updated upstream
                     std::make_pair(UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_)
                     , INVALID_ID));
             } else {
                 output_chunk[output_size].first = UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_);
+=======
+                    // Update UnionTuple to pointer so no per-tuple copying
+                    std::make_pair(*UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_)
+                    , INVALID_ID));
+            } else {
+                // Update UnionTuple to pointer so no per-tuple copying
+                output_chunk[output_size].first = *UnionTuple(probe_tuple, tuples_.begin() + match_ite->second, width_);
+>>>>>>> Stashed changes
                 output_chunk[output_size].second = INVALID_ID;
             }
             output_size++;

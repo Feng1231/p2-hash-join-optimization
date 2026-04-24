@@ -4,6 +4,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <robin_hood.h>
 
 namespace babydb {
 
@@ -42,7 +43,7 @@ private:
 
     idx_t width_;
 
-    std::unordered_multimap<data_t, idx_t> pointer_table_;
+    robin_hood::unordered_map<data_t, idx_t> pointer_table_;
 
     Chunk buffer_;
 
