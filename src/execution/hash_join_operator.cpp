@@ -27,6 +27,8 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         BuildHashTable();
     }
 
+    output_chunk.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
+
     auto &probe_child_operator = child_operators_[0];
     auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
     while (output_size < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
