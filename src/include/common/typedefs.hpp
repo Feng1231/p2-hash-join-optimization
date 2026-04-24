@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace babydb {
 
@@ -32,6 +33,7 @@ public:
 
     Tuple KeysFromTuple(const std::vector<idx_t> &key_attrs) const {
         Tuple result;
+        result.reserve(key_attrs.size());
         for (auto position : key_attrs) {
             result.push_back(this->operator[](position));
         }
@@ -43,6 +45,19 @@ public:
     }
 };
 
+// Zero-copy: Shared tuple using shared_ptr (no copying)
+using SharedTuple = std::shared_ptr<const Tuple>;
+
+// Zero-copy chunk - stores shared pointers instead of copies
+struct ChunkEntry {
+    SharedTuple tuple;
+    idx_t row_id;
+    
+    ChunkEntry() : tuple(nullptr), row_id(INVALID_ID) {}
+    ChunkEntry(SharedTuple t, idx_t id) : tuple(std::move(t)), row_id(id) {}
+};
+using Chunk = std::vector<ChunkEntry>;
+
 //! Since babydb only has one type, the schema of the table is just the column names.
 class Schema : public std::vector<std::string> {
 public:
@@ -50,6 +65,7 @@ public:
 
     std::vector<idx_t> GetKeyAttrs(const Schema &key_schema) const {
         std::vector<idx_t> result;
+        result.reserve(key_schema.size());
         for (auto cname : key_schema) {
             result.push_back(GetKeyAttr(cname));
         }
@@ -75,4 +91,4 @@ private:
     }
 };
 
-}
+}   

@@ -1,17 +1,12 @@
 #pragma once
 
 #include "execution/operator.hpp"
-
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace babydb {
 
-/**
- * Hash Join Operator
- * We only support equavilant join on one column.
- * The output schema is just the union of the input's schema.
- */
 class HashJoinOperator : public Operator {
 public:
     HashJoinOperator(const ExecutionContext &exec_ctx,
@@ -23,9 +18,7 @@ public:
     ~HashJoinOperator() override = default;
     
     OperatorState Next(Chunk &output_chunk) override;
-
     void SelfInit() override;
-
     void SelfCheck() override;
 
 private:
@@ -33,24 +26,21 @@ private:
 
 private:
     std::string probe_column_name_;
-
     std::string build_column_name_;
 
-    std::vector<data_t> tuples_;
-
+    // Store build side as shared tuples (zero-copy)
+    std::vector<SharedTuple> build_tuples_;
     idx_t tuple_count_;
-
     idx_t width_;
 
+    // Hash table: key -> index into build_tuples_
     std::unordered_multimap<data_t, idx_t> pointer_table_;
 
-    Chunk buffer_;
-
-    idx_t buffer_ptr_;
-
-    bool probe_child_exhausted_;
-
-    bool hash_table_build_;
+    // Reusable buffers
+    Chunk probe_buffer_;
+    size_t probe_pos_;
+    bool probe_exhausted_;
+    bool hash_table_built_;
 };
 
-}
+} 

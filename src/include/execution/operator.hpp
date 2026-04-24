@@ -10,7 +10,7 @@
 
 namespace babydb {
 
-typedef std::vector<std::pair<Tuple, idx_t>> Chunk;
+// Chunk is now defined in typedefs.hpp as vector<ChunkEntry>
 
 enum OperatorState {
     HAVE_MORE_OUTPUT,
@@ -61,7 +61,6 @@ public:
 
 protected:
     virtual void SelfInit() = 0;
-
     virtual void SelfCheck() = 0;
 
     void CheckSchema() {
@@ -76,9 +75,7 @@ protected:
 
 protected:
     ExecutionContext exec_ctx_;
-
     std::vector<std::shared_ptr<Operator>> child_operators_;
-
     Schema output_schema_;
 };
 

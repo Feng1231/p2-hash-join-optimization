@@ -5,10 +5,6 @@
 
 namespace babydb {
 
-/**
- * Filter Operator
- * The output schema is the same as the input.
- */
 class FilterOperator : public Operator {
 public:
     FilterOperator(const ExecutionContext &exec_ctx,
@@ -27,11 +23,11 @@ public:
 
 private:
     void SelfInit() override;
-
     void SelfCheck() override;
 
 private:
     std::vector<std::unique_ptr<Filter>> filters_;
+    Chunk reusable_buffer_;  // Reuse buffer across calls
 };
 
 }
