@@ -27,32 +27,44 @@ static Tuple UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &sta
 }
 
 void HashJoinOperator::FlushColumnarToChunk(Chunk &output_chunk) {
-    if (columnar_row_count_.empty()) {
+    if (columnar_output_.empty() || columnar_output_[0].empty()) {
         return;
     }
     
-    // Reserve space in output chunk
-    output_chunk.reserve(output_chunk.size() + columnar_row_count_[0]);
+    idx_t num_rows = columnar_output_[0].size();
     
-    // Convert columnar to row-by-row format
-    idx_t num_rows = columnar_row_count_[0];
+    // Pre-allocate exact size needed
+    output_chunk.reserve(output_chunk.size() + num_rows);
+    
+    // Convert columnar to row format
     for (idx_t row = 0; row < num_rows; row++) {
         Tuple result;
         result.reserve(num_output_columns_);
         
-        // Build tuple by collecting from each column
         for (idx_t col = 0; col < num_output_columns_; col++) {
             result.push_back(columnar_output_[col][row]);
         }
         
         output_chunk.emplace_back(std::move(result), INVALID_ID);
+        
+        // Early exit if output chunk is full
+        if (output_chunk.size() >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+            // Keep remaining rows in columnar buffers for next call
+            // Remove the rows we've already output
+            for (idx_t col = 0; col < num_output_columns_; col++) {
+                columnar_output_[col].erase(columnar_output_[col].begin(), 
+                                           columnar_output_[col].begin() + row + 1);
+            }
+            return;
+        }
     }
     
-    // Clear columnar buffers for next batch
+    // Clear columnar buffers after flushing all rows
     for (auto& col : columnar_output_) {
         col.clear();
     }
-    columnar_row_count_.assign(num_output_columns_, 0);
+    columnar_output_.clear();
+    columnar_output_.shrink_to_fit();
 }
 
 OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
@@ -66,14 +78,17 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
             auto& build_schema = child_operators_[1]->GetOutputSchema();
             num_output_columns_ = probe_schema.size() + build_schema.size();
             columnar_output_.resize(num_output_columns_);
-            columnar_row_count_.assign(num_output_columns_, 0);
+            // Reserve reasonable capacity
+            for (auto& col : columnar_output_) {
+                col.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
+            }
         }
     }
 
     auto &probe_child_operator = child_operators_[0];
     auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
     
-    while (true) {
+    while (output_chunk.size() < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
         // Refill buffer if needed
         if (buffer_ptr_ == buffer_.size() && !probe_child_exhausted_) {
             if (probe_child_operator->Next(buffer_) == EXHAUSETED) {
@@ -82,16 +97,15 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
             buffer_ptr_ = 0;
         }
         
-        // No more input
+        // No more input - flush remaining columnar data
         if (buffer_ptr_ == buffer_.size()) {
-            // Flush remaining columnar data
-            if (use_columnar_ && columnar_row_count_[0] > 0) {
+            if (use_columnar_ && !columnar_output_.empty() && !columnar_output_[0].empty()) {
                 FlushColumnarToChunk(output_chunk);
-                if (!output_chunk.empty()) {
-                    return HAVE_MORE_OUTPUT;
-                }
             }
-            return EXHAUSETED;
+            if (output_chunk.empty()) {
+                return EXHAUSETED;
+            }
+            return HAVE_MORE_OUTPUT;
         }
 
         auto &probe_tuple = buffer_[buffer_ptr_].first;
@@ -99,18 +113,23 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         
         auto match_range = pointer_table_.equal_range(probe_tuple.KeyFromTuple(probe_key_attr));
         
-        if (use_columnar_ && match_range.first != match_range.second) {
-            // Columnar output path - store values directly in column vectors
+        if (match_range.first == match_range.second) {
+            continue;  // No matches
+        }
+        
+        if (use_columnar_) {
+            // Columnar output path
             idx_t probe_col_offset = 0;
             idx_t build_col_offset = child_operators_[0]->GetOutputSchema().size();
             
             for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
-                // Check if we need to flush (buffer full)
-                if (columnar_row_count_[0] >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+                // Check if columnar buffer is getting full
+                if (columnar_output_[0].size() >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
+                    // Flush current batch
                     FlushColumnarToChunk(output_chunk);
                     if (output_chunk.size() >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
-                        // Output chunk is full, return
-                        buffer_ptr_--;  // Reprocess current tuple next time
+                        // Output chunk is full, reprocess current tuple next time
+                        buffer_ptr_--;
                         return HAVE_MORE_OUTPUT;
                     }
                 }
@@ -125,14 +144,9 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
                 for (idx_t i = 0; i < width_; i++) {
                     columnar_output_[build_col_offset + i].push_back(*(build_start + i));
                 }
-                
-                // Update row counts
-                for (idx_t i = 0; i < num_output_columns_; i++) {
-                    columnar_row_count_[i]++;
-                }
             }
         } else {
-            // Row-based output path (fallback for small result sets or when columnar disabled)
+            // Row-based output path (fallback)
             for (auto match_ite = match_range.first; match_ite != match_range.second; match_ite++) {
                 if (output_chunk.size() >= exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
                     buffer_ptr_--;  // Reprocess current tuple next time
@@ -142,21 +156,25 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
             }
         }
     }
+    
+    return HAVE_MORE_OUTPUT;
 }
 
 void HashJoinOperator::SelfInit() {
     tuple_count_ = 0;
     width_ = child_operators_[1]->GetOutputSchema().size();
     tuples_.clear();
+    tuples_.shrink_to_fit();
     pointer_table_.clear();
     buffer_.clear();
     buffer_ptr_ = 0;
     probe_child_exhausted_ = false;
     hash_table_build_ = false;
     
-    // Clear columnar buffers
+    // Clear columnar buffers and free memory
     for (auto& col : columnar_output_) {
         col.clear();
+        std::vector<data_t>().swap(col);  // Force deallocation
     }
     columnar_output_.clear();
     columnar_row_count_.clear();
@@ -184,10 +202,11 @@ void HashJoinOperator::BuildHashTable() {
         }
     }
     
-    pointer_table_.reserve(tuple_count_ * 2);
+    pointer_table_.reserve(tuple_count_);
     
     for (idx_t i = 0; i < tuple_count_; i++) {
-        pointer_table_.insert(std::make_pair(tuples_[i * width_ + build_key_attr], i * width_));
+        idx_t offset = i * width_;
+        pointer_table_.insert(std::make_pair(tuples_[offset + build_key_attr], offset));
     }
 }
 
