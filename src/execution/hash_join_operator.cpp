@@ -27,6 +27,9 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         BuildHashTable();
     }
 
+    // reserve capacity to avoid repeated resizing
+    output_chunk.reserve(exec_ctx_.config_.CHUNK_SUGGEST_SIZE);
+
     auto &probe_child_operator = child_operators_[0];
     auto probe_key_attr = probe_child_operator->GetOutputSchema().GetKeyAttrs({probe_column_name_})[0];
     while (output_size < exec_ctx_.config_.CHUNK_SUGGEST_SIZE) {
@@ -93,7 +96,7 @@ void HashJoinOperator::BuildHashTable() {
     // to reduce the probe complexity
     pointer_table_.reserve(tuple_count_ * 4);
     for (idx_t i = 0; i < tuple_count_; i++) {
-        pointer_table_.insert(std::make_pair(tuples_[i * width_ + build_key_attr], i * width_));
+        pointer_table_.emplace(tuples_[i * width_ + build_key_attr], i * width_);
     }
 }
 
