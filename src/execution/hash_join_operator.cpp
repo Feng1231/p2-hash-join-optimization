@@ -1,7 +1,9 @@
 #include "execution/hash_join_operator.hpp"
-#include  <array>
+
 #include "common/config.hpp"
 #include <cmath>
+#include <array>      
+#include <algorithm>  
 
 namespace babydb {
 
@@ -9,23 +11,31 @@ namespace babydb {
 
 BloomFilter::BloomFilter(size_t expected_insertions, double false_positive_rate)
     : bits_(optimal_bit_count(expected_insertions, false_positive_rate), false),
-      num_hash_functions_(optimal_hash_count(bits_.size(), expected_insertions)) {}
+      num_hash_functions_(optimal_hash_count(bits_.size(), expected_insertions)) {
+    // Prevent excessive memory allocation
+    if (bits_.size() > 100 * 1024 * 1024) {  // Cap at 100MB
+        bits_.resize(100 * 1024 * 1024);
+        num_hash_functions_ = optimal_hash_count(bits_.size(), expected_insertions);
+    }
+}
 
 size_t BloomFilter::optimal_bit_count(size_t n, double p) {
     // m = -n * ln(p) / (ln(2)^2)
-    return std::max<size_t>(64, static_cast<size_t>(-n * std::log(p) / (std::log(2) * std::log(2))));
+    if (n == 0) return 64;
+    size_t result = static_cast<size_t>(-static_cast<double>(n) * std::log(p) / (std::log(2) * std::log(2)));
+    return std::max<size_t>(64, std::min<size_t>(100 * 1024 * 1024, result));  // Cap at 100MB
 }
 
 size_t BloomFilter::optimal_hash_count(size_t m, size_t n) {
     // k = (m/n) * ln(2)
-    return std::max<size_t>(1, std::min<size_t>(10, static_cast<size_t>(m * std::log(2) / n)));
+    if (n == 0) return 2;
+    size_t result = static_cast<size_t>(static_cast<double>(m) * std::log(2) / static_cast<double>(n));
+    return std::max<size_t>(1, std::min<size_t>(10, result));
 }
 
 std::array<size_t, 2> BloomFilter::get_hashes(const data_t& key) const {
     std::hash<data_t> hasher;
     size_t h1 = hasher(key);
-    // Double hashing: h2 = h1 + (h1 >> 33) + 1
-    // This gives good distribution without needing a second hash function
     size_t h2 = h1 + (h1 >> 33) + 1;
     return {h1, h2};
 }
@@ -43,10 +53,10 @@ bool BloomFilter::might_contain(const data_t& key) const {
     for (size_t i = 0; i < num_hash_functions_; ++i) {
         size_t index = (h1 + i * h2) % bits_.size();
         if (!bits_[index]) {
-            return false;  // Definitely not in set
+            return false;
         }
     }
-    return true;  // Might be in set
+    return true;
 }
 
 void BloomFilter::clear() {
@@ -69,12 +79,6 @@ HashJoinOperator::HashJoinOperator(const ExecutionContext &exec_ctx,
       probe_child_exhausted_(false),
       hash_table_build_(false) {}
 
-static Tuple UnionTuple(const Tuple &a, const std::vector<data_t>::iterator &start, idx_t width) {
-    Tuple result = a;
-    result.insert(result.end(), start, start + width);
-    return result;
-}
-
 void HashJoinOperator::BuildHashTable() {
     auto &build_child_operator = child_operators_[1];
     OperatorState state = HAVE_MORE_OUTPUT;
@@ -95,11 +99,13 @@ void HashJoinOperator::BuildHashTable() {
         }
     }
     
-    // Build the hash table and Bloom filter
-    // Bloom filter size: about 2x the number of distinct keys for good cache performance
-    // But we don't know distinct count, so use tuple_count as estimate
-    bloom_filter_ = std::make_unique<BloomFilter>(tuple_count_ * 2, 0.01);
-    pointer_table_.reserve(tuple_count_ * 2);  // Reserve extra space for collisions
+    // Build the hash table
+    pointer_table_.reserve(tuple_count_ * 2);
+    
+    // Estimate distinct keys for Bloom filter (use tuple_count as upper bound)
+    // But cap the Bloom filter size to avoid memory issues
+    size_t bloom_size = std::min<size_t>(tuple_count_, 1000000);  // Cap at 1M entries
+    bloom_filter_ = std::make_unique<BloomFilter>(bloom_size, 0.01);
     
     for (idx_t i = 0; i < tuple_count_; i++) {
         data_t key = tuples_[i * width_ + build_key_attr];
@@ -148,11 +154,7 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         // BLOOM FILTER OPTIMIZATION:
         // Fast pre-filter - if Bloom filter says the key is definitely not in the build set,
         // skip this tuple entirely without expensive hash table lookup.
-        // This is the key optimization that improves cache locality because:
-        // 1. Bloom filter is much smaller (~2x distinct keys) and fits in L2/L3 cache
-        // 2. Hash table lookup is expensive due to random memory access and pointer chasing
-        // 3. Many probe tuples in JOB queries have no matches, especially early in the join chain
-        if (!bloom_filter_->might_contain(probe_key)) {
+        if (bloom_filter_ && !bloom_filter_->might_contain(probe_key)) {
             continue;  // Early reject - this tuple has no match
         }
         
@@ -162,7 +164,6 @@ OperatorState HashJoinOperator::Next(Chunk &output_chunk) {
         // Generate all matching output tuples
         for (auto match_ite = match_range.first; match_ite != match_range.second; ++match_ite) {
             if (output_chunk.size() == output_chunk.capacity()) {
-                // Need to grow - but we reserved, so this shouldn't happen often
                 output_chunk.reserve(output_chunk.size() * 2);
             }
             
