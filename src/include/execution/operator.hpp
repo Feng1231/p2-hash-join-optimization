@@ -7,8 +7,14 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 
 namespace babydb {
+
+// Forward declaration so Operator can reference BloomFilter without pulling in
+// the full header everywhere.  Operators that actually use BFs (HashJoin,
+// SeqScan) will include bloom_filter.hpp directly.
+class BloomFilter;
 
 typedef std::vector<std::pair<Tuple, idx_t>> Chunk;
 
@@ -59,6 +65,31 @@ public:
 
     virtual std::string BindTableName() { return INVALID_NAME; }
 
+    /**
+     * RPT-style Bloom filter pushdown.
+     *
+     * A HashJoinOperator calls this on its probe child (and the probe child
+     * forwards it further down the tree) to register a BF that should be
+     * applied as early as possible — ideally inside a SeqScanOperator before
+     * any per-tuple work is done.
+     *
+     * The default implementation is a no-op: operators that sit in the middle
+     * of a probe pipeline but cannot reason about column provenance (e.g.,
+     * future aggregates or projections) simply ignore the registration, which
+     * is safe — the BF will just not be applied at that level.
+     *
+     * Operators that *can* forward the BF (HashJoinOperator) or consume it
+     * (SeqScanOperator) override this method.
+     *
+     * @param bf           Shared Bloom filter built over the build-side keys.
+     * @param column_name  The fully-qualified output column name that the BF
+     *                     was built for (e.g. "movie_info.movie_id").
+     */
+    virtual void RegisterBloomFilter(std::shared_ptr<BloomFilter> /*bf*/,
+                                     const std::string & /*column_name*/) {
+        // Default: no-op (safe to ignore)
+    }
+
 protected:
     virtual void SelfInit() = 0;
 
@@ -82,4 +113,4 @@ protected:
     Schema output_schema_;
 };
 
-}
+}  // namespace babydb
