@@ -11,15 +11,14 @@ namespace babydb {
 /**
  * A fast, cache-friendly Bloom filter for RPT-style pushdown filtering.
  *
- * Design decisions (addressing the student's slow scalar BF):
+ * Design decisions:
  *
  * 1. Backed by std::vector<uint64_t> instead of std::vector<bool>.
  *    Bit access is done via explicit shifts and masks, avoiding the
  *    per-access overhead of the bit-packing iterator in std::vector<bool>.
  *
  * 2. Capacity is always a power of two.  Probing uses (hash & mask_)
- *    instead of (hash % size_), eliminating the 64-bit IDIV that was
- *    in the hot loop of the student's version.
+ *    instead of (hash % size_).
  *
  * 3. Hashing uses splitmix64 for the primary hash (good avalanche,
  *    fast on 64-bit hardware) and a second independent mix for h2.

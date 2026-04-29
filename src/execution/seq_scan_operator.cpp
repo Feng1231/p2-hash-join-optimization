@@ -5,7 +5,7 @@
 
 namespace babydb {
 
-// ---- Local helpers (unchanged from baseline) --------------------------------
+// ---- Local helpers --------------------------------
 
 static const Schema &FetchTableSchema(const ExecutionContext &exec_ctx,
                                       const std::string &table_name) {
@@ -20,7 +20,7 @@ static Schema CombineSchema(const std::string &table_name, const Schema &schema)
     return schema_copy;
 }
 
-// ---- Constructors (unchanged from baseline) ---------------------------------
+// ---- Constructors ---------------------------------
 
 SeqScanOperator::SeqScanOperator(const ExecutionContext &exec_ctx,
                                  const std::string &table_name)
